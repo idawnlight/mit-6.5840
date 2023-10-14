@@ -22,8 +22,42 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type NReduceReply struct {
+	NReduce int
+}
 
+type TaskReply struct {
+	Waiting bool
+	Done    bool
+
+	ReducePhase bool
+
+	// MapTask
+	MapFile string
+
+	// ReduceTask
+	ReduceTaskNum int
+}
+
+func NewTaskReply() *TaskReply {
+	return &TaskReply{
+		Waiting:       false,
+		Done:          false,
+		ReducePhase:   false,
+		MapFile:       "",
+		ReduceTaskNum: 0,
+	}
+}
+
+type MapSuccessArgs struct {
+	MapFile string
+}
+
+type ReduceSuccessArgs struct {
+	ReduceTaskNum int
+}
+
+// Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
