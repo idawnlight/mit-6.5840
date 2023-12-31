@@ -159,8 +159,8 @@ type Raft struct {
 }
 
 func randomElectionTimeout() time.Duration {
-	res := time.Duration(200+rand.Int63n(200)) * time.Millisecond
-	debug(dTimer, "randomElectionTimeout: %vms", res.Milliseconds())
+	res := time.Duration(400+rand.Int63n(200)) * time.Millisecond
+	// debug(dTimer, "randomElectionTimeout: %vms", res.Milliseconds())
 	return res
 }
 
@@ -316,6 +316,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = FOLLOWER
 	}
 
+	if args.Term == rf.currentTerm && rf.state == CANDIDATE {
+		debug(dLog, "S%v receive same term from S%v, convert to follower", rf.me, args.LeaderId)
+		rf.state = FOLLOWER
+	}
+
 	// received AppendEntries RPC from current leader, reset election timer
 	debug(dLog, "S%v receive AppendEntries from S%v, reset election timer", rf.me, args.LeaderId)
 	rf.heartbeatCh <- struct{}{}
@@ -441,13 +446,7 @@ func (rf *Raft) ticker() {
 				debug(dTimer, "S%v voted, reset election timer as FOLLOWER", rf.me)
 			case <-time.After(randomElectionTimeout()):
 				debug(dTimer, "S%v election timer expired as FOLLOWER", rf.me)
-
-				rf.mu.Lock()
-				rf.state = CANDIDATE
-				rf.currentTerm++
-				rf.votedFor = rf.me
-				rf.mu.Unlock()
-
+				rf.preElection()
 				go rf.startElection()
 			}
 		case CANDIDATE:
@@ -459,13 +458,7 @@ func (rf *Raft) ticker() {
 				debug(dTimer, "S%v receive heartbeat as CANDIDATE, convert to follower", rf.me)
 			case <-time.After(randomElectionTimeout()):
 				debug(dTimer, "S%v election timer expired as CANDIDATE", rf.me)
-
-				rf.mu.Lock()
-				rf.state = CANDIDATE
-				rf.currentTerm++
-				rf.votedFor = rf.me
-				rf.mu.Unlock()
-
+				rf.preElection()
 				go rf.startElection()
 			}
 		case LEADER:
@@ -473,9 +466,18 @@ func (rf *Raft) ticker() {
 			select {
 			case <-rf.heartbeatCh:
 			case <-time.After(HEARTBEAT_INTERVAL):
+				go rf.heartbeat()
 			}
 		}
 	}
+}
+
+func (rf *Raft) preElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.state = CANDIDATE
+	rf.currentTerm++
+	rf.votedFor = rf.me
 }
 
 func (rf *Raft) startElection() {
@@ -497,11 +499,14 @@ func (rf *Raft) startElection() {
 		go func(i int) {
 			reply := RequestVoteReply{}
 			debug(dVote, "S%v send RequestVote to S%v", rf.me, i)
+			startTime := time.Now()
 			if ok := rf.sendRequestVote(i, &args, &reply); !ok {
 				debug(dVote, "S%v send RequestVote to S%v failed", rf.me, i)
 				voteCh <- false
 				return
 			}
+			// debug(dVote, "S%v receive reply from S%v", rf.me, i)
+			debug(dVote, "S%v receive reply from S%v after %vus", rf.me, i, time.Since(startTime).Microseconds())
 			if reply.Term > args.Term {
 				// If RPC response contains term T > currentTerm:
 				// set currentTerm = T, convert to follower
@@ -547,80 +552,35 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) heartbeat() {
-	wakeChPool := make([]chan struct{}, len(rf.peers))
-	doneChPool := make([]chan struct{}, len(rf.peers))
-	// allocate each peer with a go routine to send AppendEntries RPCs
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		wakeChPool[i] = make(chan struct{})
-		doneChPool[i] = make(chan struct{})
-		go func(i int) { // replicator go routine
-			for {
-				select {
-				case <-wakeChPool[i]:
-					debug(dLeader, "S%v send heartbeat to S%v", rf.me, i)
-					args := AppendEntriesArgs{LeaderId: rf.me}
-					reply := AppendEntriesReply{}
-					rf.mu.RLock()
-					args.Term = rf.currentTerm
-					rf.mu.RUnlock()
-
-					go func() {
-						if ok := rf.sendAppendEntries(i, &args, &reply); !ok {
-							debug(dLeader, "S%v send heartbeat to S%v failed", rf.me, i)
-							return
-						}
-						rf.mu.Lock()
-						if reply.Term > rf.currentTerm {
-							debug(dLeader, "S%v receive higher term from S%v during heartbeat, convert to follower", rf.me, i)
-							rf.currentTerm = reply.Term
-							rf.votedFor = -1
-							rf.state = FOLLOWER
-							rf.mu.Unlock()
-							return
-						}
-						rf.mu.Unlock()
-					}()
-				case <-doneChPool[i]:
-					debug(dLeader, "S%v stop sending heartbeat to S%v", rf.me, i)
-					return
-				}
-			}
-		}(i)
-	}
-
-	broadcast := func() {
-		debug(dLeader, "S%v start broadcasting heartbeat", rf.me)
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			go func(i int) {
-				wakeChPool[i] <- struct{}{}
-			}(i)
-		}
-	}
-	broadcast()
-
-	heartbeatTimer := time.NewTimer(HEARTBEAT_INTERVAL)
-	for {
-		<-heartbeatTimer.C
-		if rf.killed() || !rf.isLeader() {
-			break
-		}
-		heartbeatTimer.Reset(HEARTBEAT_INTERVAL)
-		broadcast()
-	}
-
-	// killed or no longer the leader, release go routines
+	debug(dLeader, "S%v start broadcasting heartbeat", rf.me)
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		go func(i int) {
-			doneChPool[i] <- struct{}{}
+			debug(dLeader, "S%v send heartbeat to S%v", rf.me, i)
+			args := AppendEntriesArgs{LeaderId: rf.me}
+			reply := AppendEntriesReply{}
+			rf.mu.RLock()
+			args.Term = rf.currentTerm
+			rf.mu.RUnlock()
+
+			go func() {
+				if ok := rf.sendAppendEntries(i, &args, &reply); !ok {
+					debug(dLeader, "S%v send heartbeat to S%v failed", rf.me, i)
+					return
+				}
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					debug(dLeader, "S%v receive higher term from S%v during heartbeat, convert to follower", rf.me, i)
+					rf.currentTerm = reply.Term
+					rf.votedFor = -1
+					rf.state = FOLLOWER
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
+			}()
 		}(i)
 	}
 }

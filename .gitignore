@@ -3,5 +3,9 @@ api.key
 .api.key.trimmed
 *-handin.tar.gz
 
+**/.DS_Store
+
 .idea/
-src/raft/result
+src/raft/result*
+src/raft/dstest.py
+src/raft/venv
