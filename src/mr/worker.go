@@ -112,20 +112,12 @@ func Worker(mapf func(string, string) []KeyValue,
 		// log.Println("Worker received reduce task", taskNum)
 
 		outputFileName := fmt.Sprintf("mr-out-%v", taskNum)
-
-		// Create if not exist
-		if _, err := os.Stat(outputFileName); os.IsNotExist(err) {
-			if file, err := os.Create(outputFileName); err != nil {
-				log.Fatalf("cannot create %v", outputFileName)
-			} else {
-				file.Close()
-			}
-		}
-
-		outputFile, err := os.OpenFile(outputFileName, os.O_APPEND|os.O_WRONLY, 0644)
+		outputFile, err := os.Create(outputFileName)
 		if err != nil {
 			log.Fatalf("cannot create %v", outputFileName)
 		}
+
+		defer outputFile.Close()
 
 		kva := make(map[string][]string)
 
