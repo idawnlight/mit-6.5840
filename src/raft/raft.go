@@ -98,21 +98,11 @@ const (
 
 const HEARTBEAT_INTERVAL = 50 * time.Millisecond
 
-// func timerResetHelper(timer *time.Timer, interval time.Duration) {
-// 	debug(dTimer, "timerResetHelper: %vms", interval.Milliseconds())
-// 	timer = time.NewTimer(interval)
-// 	// if !timer.Stop() {
-// 	// 	debug(dTimer, "timerResetHelper: timer already stopped")
-// 	// 	select {
-// 	// 	case <-timer.C:
-// 	// 	default:
-// 	// 	}
-// 	// } else {
-// 	// 	debug(dTimer, "timerResetHelper: timer stopped")
-// 	// }
-// 	// timer.Reset(interval)
-// 	// debug(dTimer, "timerResetHelper: timer reset")
-// }
+type LogEntry struct {
+	Term    int
+	Index   int
+	Command interface{}
+}
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -151,8 +141,10 @@ type Raft struct {
 
 	currentTerm int
 	votedFor    int
+	log         []LogEntry
 
 	// channels to replace timer
+	applyCh     chan ApplyMsg
 	heartbeatCh chan struct{}
 	grantVoteCh chan struct{}
 	winElectCh  chan struct{}
@@ -177,6 +169,20 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) isLeader() bool {
 	_, isLeader := rf.GetState()
 	return isLeader
+}
+
+func (rf *Raft) getLastLog() LogEntry {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	return rf.log[len(rf.log)-1]
+}
+
+func (rf *Raft) getLastLogTerm() int {
+	return rf.getLastLog().Term
+}
+
+func (rf *Raft) getLastLogIndex() int {
+	return rf.getLastLog().Index
 }
 
 // save Raft's persistent state to stable storage,
@@ -230,8 +236,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
+	Term        int
+	CandidateId int
+
 	LastLogIndex int
 	LastLogTerm  int
 }
@@ -247,11 +254,19 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []interface{}
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	Success bool
 	Term    int
+
+	// optimization: next index to try if not successful
+	NextTryIndex int
 }
 
 // example RequestVote RPC handler.
@@ -286,8 +301,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		rf.votedFor = args.CandidateId
 		rf.grantVoteCh <- struct{}{}
-
-		// timerResetHelper(&rf.electionTimer, randomElectionTimeout())
 	} else {
 		debug(dVote, "S%v reject vote for S%v", rf.me, args.CandidateId)
 		reply.VoteGranted = false
@@ -408,70 +421,6 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-		// Your code here (2A)
-		// Check if a leader election should be started.
-
-		// select {
-		// case <-rf.electionTimer.C:
-		// 	debug(dTimer, "S%v election timer expired", rf.me)
-		// 	rf.mu.Lock()
-		// 	if rf.state == LEADER {
-		// 		debug(dLeader, "S%v is leader, do nothing", rf.me)
-		// 		rf.mu.Unlock()
-		// 		continue
-		// 	}
-		// 	// start election
-		// 	debug(dTimer, "S%v start election", rf.me)
-		// 	rf.state = CANDIDATE
-		// 	rf.currentTerm++
-		// 	rf.votedFor = rf.me
-		// 	timerResetHelper(&rf.electionTimer, randomElectionTimeout())
-		// 	rf.mu.Unlock()
-		// 	go rf.startElection()
-		// }
-
-		rf.mu.RLock()
-		state := rf.state
-		rf.mu.RUnlock()
-
-		switch state {
-		case FOLLOWER:
-			debug(dInfo, "S%v ticking as FOLLOWER", rf.me)
-			select {
-			case <-rf.heartbeatCh:
-				debug(dTimer, "S%v receive heartbeat as FOLLOWER, reset election timer", rf.me)
-			case <-rf.grantVoteCh:
-				debug(dTimer, "S%v voted, reset election timer as FOLLOWER", rf.me)
-			case <-time.After(randomElectionTimeout()):
-				debug(dTimer, "S%v election timer expired as FOLLOWER", rf.me)
-				rf.preElection()
-				go rf.startElection()
-			}
-		case CANDIDATE:
-			debug(dInfo, "S%v ticking as CANDIDATE", rf.me)
-			select {
-			case <-rf.winElectCh:
-				debug(dTimer, "S%v win election as CANDIDATE", rf.me)
-			case <-rf.heartbeatCh:
-				debug(dTimer, "S%v receive heartbeat as CANDIDATE, convert to follower", rf.me)
-			case <-time.After(randomElectionTimeout()):
-				debug(dTimer, "S%v election timer expired as CANDIDATE", rf.me)
-				rf.preElection()
-				go rf.startElection()
-			}
-		case LEADER:
-			debug(dInfo, "S%v ticking as LEADER", rf.me)
-			select {
-			case <-rf.heartbeatCh:
-			case <-time.After(HEARTBEAT_INTERVAL):
-				go rf.heartbeat()
-			}
-		}
-	}
-}
-
 func (rf *Raft) preElection() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -545,13 +494,13 @@ func (rf *Raft) startElection() {
 			rf.state = LEADER
 			rf.mu.Unlock()
 			rf.winElectCh <- struct{}{}
-			go rf.heartbeat()
+			go rf.broadcast()
 			return
 		}
 	}
 }
 
-func (rf *Raft) heartbeat() {
+func (rf *Raft) broadcast() {
 	debug(dLeader, "S%v start broadcasting heartbeat", rf.me)
 	for i := range rf.peers {
 		if i == rf.me {
@@ -585,6 +534,51 @@ func (rf *Raft) heartbeat() {
 	}
 }
 
+func (rf *Raft) ticker() {
+	for rf.killed() == false {
+		// Your code here (2A)
+		// Check if a leader election should be started.
+
+		rf.mu.RLock()
+		state := rf.state
+		rf.mu.RUnlock()
+
+		switch state {
+		case FOLLOWER:
+			debug(dInfo, "S%v ticking as FOLLOWER", rf.me)
+			select {
+			case <-rf.heartbeatCh:
+				debug(dTimer, "S%v receive heartbeat as FOLLOWER, reset election timer", rf.me)
+			case <-rf.grantVoteCh:
+				debug(dTimer, "S%v voted, reset election timer as FOLLOWER", rf.me)
+			case <-time.After(randomElectionTimeout()):
+				debug(dTimer, "S%v election timer expired as FOLLOWER", rf.me)
+				rf.preElection()
+				go rf.startElection()
+			}
+		case CANDIDATE:
+			debug(dInfo, "S%v ticking as CANDIDATE", rf.me)
+			select {
+			case <-rf.winElectCh:
+				debug(dTimer, "S%v win election as CANDIDATE", rf.me)
+			case <-rf.heartbeatCh:
+				debug(dTimer, "S%v receive heartbeat as CANDIDATE, convert to follower", rf.me)
+			case <-time.After(randomElectionTimeout()):
+				debug(dTimer, "S%v election timer expired as CANDIDATE", rf.me)
+				rf.preElection()
+				go rf.startElection()
+			}
+		case LEADER:
+			debug(dInfo, "S%v ticking as LEADER", rf.me)
+			select {
+			case <-rf.heartbeatCh:
+			case <-time.After(HEARTBEAT_INTERVAL):
+				go rf.broadcast()
+			}
+		}
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -605,11 +599,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.log = append(rf.log, LogEntry{Term: 0})
 
-	rf.heartbeatCh = make(chan struct{}, 1)
-	rf.grantVoteCh = make(chan struct{}, 1)
-	rf.winElectCh = make(chan struct{}, 1)
-	// rf.electionTimer = *time.NewTimer(randomElectionTimeout())
+	rf.applyCh = applyCh
+	rf.heartbeatCh = make(chan struct{}, 100)
+	rf.grantVoteCh = make(chan struct{}, 100)
+	rf.winElectCh = make(chan struct{}, 100)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
