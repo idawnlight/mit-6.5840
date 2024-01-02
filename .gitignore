@@ -8,4 +8,5 @@ api.key
 .idea/
 src/raft/result*
 src/raft/dstest.py
+src/raft/dslogs.py
 src/raft/venv
